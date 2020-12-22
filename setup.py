@@ -37,7 +37,7 @@ setup(
     package_data={"locust_plugins": ["py.typed"]},
     zip_safe=False,
     install_requires=[
-        "locust>=1.0.3",
+        "locust>=1.2.3",
         "psycogreen",
         "psycopg2-binary",
         "websocket-client",
@@ -46,5 +46,6 @@ setup(
         "confluent-kafka",
         "selenium",
         "lxml",
+        "opencensus-ext-azure",
     ],
 )

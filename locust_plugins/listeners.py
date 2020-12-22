@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 import greenlet
 from dateutil import parser
-from locust.exception import RescheduleTask, StopUser, CatchResponseError
+from locust.exception import RescheduleTask, StopUser, CatchResponseError, InterruptTaskSet
 import subprocess
 import locust.env
 from typing import List
@@ -24,7 +24,9 @@ from typing import List
 
 def create_dbconn():
     try:
-        conn = psycopg2.connect(host=os.environ["PGHOST"])
+        conn = psycopg2.connect(
+            host=os.environ["PGHOST"], keepalives_idle=120, keepalives_interval=20, keepalives_count=6
+        )
     except Exception:
         logging.error(
             "Use standard postgres env vars to specify where to report locust samples (https://www.postgresql.org/docs/11/libpq-envars.html)"
@@ -36,21 +38,14 @@ def create_dbconn():
 
 class TimescaleListener:  # pylint: disable=R0902
     """
-    Timescale logs locust samples/events to a Postgres Timescale database.
-    It relies on the standard postgres env vars (like PGHOST, PGPORT etc).
-    You need to set up a timescale table first, as described in listeners_timescale_table.sql
-    Follow to intructions here, if you create a new timescaleDB - https://docs.timescale.com/latest/getting-started/setup
-    And check tables triggers after restoring DB from listeners_timescale_table.sql to prevent erros for INSERT queries - https://github.com/timescale/timescaledb/issues/1381
-    To visualize the data, use grafana and this dashboard: https://grafana.com/grafana/dashboards/10878
-    Timescale will automatically output a link to your dashboard using the env var LOCUST_GRAFANA_URL
-    (e.g. export LOCUST_GRAFANA_URL=https://my.grafana.host.com/d/qjIIww4Zz/locust?orgId=1)
+    See timescale_listener_ex.py for documentation
     """
 
     def __init__(
         self,
         env: locust.env.Environment,
         testplan: str,
-        target_env: str = os.getenv("LOCUST_TEST_ENV", ""),
+        target_env: str = "",
         profile_name: str = "",
         description: str = "",
     ):
@@ -106,12 +101,21 @@ class TimescaleListener:  # pylint: disable=R0902
         events.request_success.add_listener(self.request_success)
         events.request_failure.add_listener(self.request_failure)
         events.quitting.add_listener(self.quitting)
-        events.hatch_complete.add_listener(self.hatch_complete)
+        events.spawning_complete.add_listener(self.spawning_complete)
         atexit.register(self.exit)
 
     def _log_user_count(self):
         while True:
-            self.write_user_count()
+            if self.env.runner is None:
+                return  # there is no runner, so nothing to log...
+            try:
+                with self._user_conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO user_count(time, run_id, testplan, user_count) VALUES (%s, %s, %s, %s)""",
+                        (datetime.now(timezone.utc), self._run_id, self._testplan, self.env.runner.user_count),
+                    )
+            except psycopg2.Error as error:
+                logging.error("Failed to write user count to Postgresql: " + repr(error))
             gevent.sleep(2.0)
 
     def _run(self):
@@ -127,18 +131,6 @@ class TimescaleListener:  # pylint: disable=R0902
                     break
             gevent.sleep(0.5)
 
-    def write_user_count(self):
-        if self.env.runner is None:
-            return  # there is no runner, so nothing to log...
-        try:
-            with self._user_conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO user_count(time, run_id, testplan, user_count) VALUES (%s, %s, %s, %s)""",
-                    (datetime.now(timezone.utc), self._run_id, self._testplan, self.env.runner.user_count),
-                )
-        except psycopg2.Error as error:
-            logging.error("Failed to write user count to Postgresql: " + repr(error))
-
     def write_samples_to_db(self, samples):
         try:
             with self._conn.cursor() as cur:
@@ -151,10 +143,10 @@ class TimescaleListener:  # pylint: disable=R0902
         except psycopg2.Error as error:
             logging.error("Failed to write samples to Postgresql timescale database: " + repr(error))
 
-    def quitting(self):
+    def quitting(self, **_kwargs):
         self._finished = True
         atexit._clear()  # make sure we dont capture additional ctrl-c:s # pylint: disable=protected-access
-        self._background.join()
+        self._background.join(timeout=10)
         if not is_worker():
             self._user_count_logger.kill()
         self.exit()
@@ -188,7 +180,10 @@ class TimescaleListener:  # pylint: disable=R0902
             if isinstance(exception, CatchResponseError):
                 sample["exception"] = str(exception)
             else:
-                sample["exception"] = repr(exception)
+                try:
+                    sample["exception"] = repr(exception)
+                except AttributeError:
+                    sample["exception"] = f"{exception.__class__} (and it has no string representation)"
         else:
             sample["exception"] = None
 
@@ -226,7 +221,7 @@ class TimescaleListener:  # pylint: disable=R0902
                 (datetime.now(timezone.utc).isoformat(), self._testplan + " started by " + self._username),
             )
 
-    def hatch_complete(self, user_count):
+    def spawning_complete(self, user_count):
         if not is_worker():  # only log for master/standalone
             end_time = datetime.now(timezone.utc)
             try:
@@ -247,16 +242,15 @@ class TimescaleListener:  # pylint: disable=R0902
                 cur.execute("INSERT INTO events (time, text) VALUES (%s, %s)", (end_time, self._testplan + " finished"))
                 cur.execute(
                     "UPDATE testrun SET rps_avg = (SELECT ROUND(reqs::numeric / secs::numeric, 1) FROM \
-                    (SELECT count(*) AS reqs FROM request WHERE run_id = %s) AS requests, \
-                    (SELECT EXTRACT(epoch FROM (SELECT MAX(time)-MIN(time) FROM request WHERE run_id = %s)) AS secs) AS seconds) \
+                    (SELECT count(*) AS reqs FROM request WHERE run_id = %s AND time > %s) AS requests, \
+                    (SELECT EXTRACT(epoch FROM (SELECT MAX(time)-MIN(time) FROM request WHERE run_id = %s AND time > %s)) AS secs) AS seconds) \
                     WHERE id = %s",
-                    (self._run_id, self._run_id, self._run_id),
+                    (self._run_id, self._run_id, self._run_id, self._run_id, self._run_id),
                 )
                 cur.execute(
-                    "UPDATE testrun SET resp_time_avg = (SELECT ROUND(AVG(response_time)::numeric, 1) FROM request WHERE run_id = %s) WHERE id =  %s",
-                    (self._run_id, self._run_id),
+                    "UPDATE testrun SET resp_time_avg = (SELECT ROUND(AVG(response_time)::numeric, 1) FROM request WHERE run_id = %s AND time > %s) WHERE id =  %s",
+                    (self._run_id, self._run_id, self._run_id),
                 )
-
         except psycopg2.Error as error:
             logging.error(
                 "Failed to update testrun record (or events) with end time to Postgresql timescale database: "
@@ -269,11 +263,6 @@ class TimescaleListener:  # pylint: disable=R0902
     def exit(self):
         if not is_worker():  # on master or standalone locust run
             self.log_stop_test_run()
-        if self._conn:
-            self._conn.close()
-            self._events_conn.close()
-            self._testrun_conn.close()
-            self._user_conn.close()
 
 
 class PrintListener:  # pylint: disable=R0902
@@ -286,7 +275,7 @@ class PrintListener:  # pylint: disable=R0902
         env.events.request_failure.add_listener(self.request_failure)
         self.include_length = "length\t" if include_length else ""
         self.include_time = "time                    \t" if include_time else ""
-        print(f"\n{self.include_time}type\t{'name'.ljust(40)}\tresponse time\t{self.include_length}exception")
+        print(f"\n{self.include_time}type\t{'name'.ljust(50)}\tresponse time\t{self.include_length}exception")
 
     # @self._events.request_success.add_listener
     def request_success(self, request_type, name, response_time, response_length, **_kwargs):
@@ -297,18 +286,27 @@ class PrintListener:  # pylint: disable=R0902
         self._log_request(request_type, name, response_time, response_length, False, exception)
 
     def _log_request(self, request_type, name, response_time, response_length, success, exception):
-        e = "" if exception is None else str(exception)
+        if exception:
+            if isinstance(exception, CatchResponseError):
+                e = str(exception)
+            else:
+                try:
+                    e = repr(exception)
+                except AttributeError:
+                    e = f"{exception.__class__} (and it has no string representation)"
+        else:
+            e = ""
         if success:
             errortext = e  # should be empty but who knows, maybe there is such a case...
         else:
-            errortext = "Failed: " + e
+            errortext = "Failed: " + e[:500]
         n = name.ljust(30)
         if self.include_time:
             print(datetime.now(), end="\t")
         if self.include_length:
-            print(f"{request_type}\t{n.ljust(40)}\t{round(response_time)}\t{response_length}\t{errortext}")
+            print(f"{request_type}\t{n.ljust(50)}\t{round(response_time)}\t{response_length}\t{errortext}")
         else:
-            print(f"{request_type}\t{n.ljust(40)}\t{round(response_time)}\t{errortext}")
+            print(f"{request_type}\t{n.ljust(50)}\t{round(response_time)}\t{errortext}")
 
 
 class RescheduleTaskOnFailListener:
@@ -319,6 +317,16 @@ class RescheduleTaskOnFailListener:
 
     def request_failure(self, request_type, name, response_time, response_length, exception, **_kwargs):
         raise RescheduleTask()
+
+
+class InterruptTaskOnFailListener:
+    def __init__(self, env: locust.env.Environment):
+        # make sure to add this listener LAST, because any failures will throw an exception,
+        # causing other listeners to be skipped
+        env.events.request_failure.add_listener(self.request_failure)
+
+    def request_failure(self, request_type, name, response_time, response_length, exception, **_kwargs):
+        raise InterruptTaskSet()
 
 
 class StopUserOnFailListener:

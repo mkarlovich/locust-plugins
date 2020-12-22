@@ -8,14 +8,47 @@ So I decided to publish my own plugins and hope that others (maybe you?) will co
 
 Having this separate from "Locust core" allows the plugins to evolve faster (at the expense of being less mature), and avoids bloating Locust with functionality you might not be interested in.
 
-The plugins are grouped by type:
-* [listeners](locust_plugins/listeners.py) (request logging & graphing)
-* [users](locust_plugins/users.py) (new protocols like websockets, selenium/webdriver, http users that load html page resources)
-* readers (ways to get test data into your tests) - currently implemented [CSV](https://github.com/SvenskaSpel/locust-plugins/blob/master/locust_plugins/csvreader.py) and [MongoDB](https://github.com/SvenskaSpel/locust-plugins/blob/master/locust_plugins/mongoreader.py)
-* [wait time](locust_plugins/wait_time.py) (custom wait time functions)
-* [debug](locust_plugins/debug.py) (support for running a single user in the debugger)
+There are a couple of plugin types:
+
+## Listeners 
+- Listen to events and log things
+    - Log and graph results using TimescaleDB and Grafana ([source](locust_plugins/listeners.py), [example](examples/timescale_listener_ex.py))
+    - PrintListener (prints prints every request with response time etc) ([source](locust_plugins/listeners.py))
+    - JmeterListener (writes a jmeter-like output file) ([source](locust_plugins/jmeter_listener.py), [example](examples/timescale_listener_example.py))
+     - ApplicationInsightsListener (writes the test logs to Azure Application Insights) ([source](locust_plugins/appinsights_listener.py), [example](examples/appinsights_listener_ex.py))
+    - RescheduleTaskOnFailListener / ExitOnFailListener / StopUserOnFailListener / (perform actions when a request fails) ([source](locust_plugins/listeners.py))
+
+## Users
+- New protocols ([source](locust_plugins/users.py))
+    - WebSockets/SocketIO ([example](examples/socketio_ex.py))
+    - Selenium/Webdriver ([example](examples/webdriver.py))
+    - HTTP users that load html page resources ([example](examples/embedded_resource_manager_ex.py))
+    - Kafka ([example](examples/kafka_ex.py))
+
+## Readers 
+- Provide ways to get test data into your tests
+    - CSV ([source](https://github.com/SvenskaSpel/locust-plugins/blob/master/locust_plugins/csvreader.py), [example](examples/csvreader_ex.py))
+    - MongoDB ([source](https://github.com/SvenskaSpel/locust-plugins/blob/master/locust_plugins/mongoreader.py), [example](examples/mongoreader_ex.py))
+
+## Wait time 
+- Custom wait time functions ([source](locust_plugins/wait_time.py), [example](examples/constant_total_ips_ex.py))
+
+## Debug 
+- Support for running a single User in the debugger ([source](locust_plugins/debug.py), [example](examples/debug_ex.py))
+
+## Transaction manager
+- Support for logging transactions (aggregating multiple requests or other actions) ([source](locust_plugins/transaction_manager.py), [example](examples/transaction_example.py))
+
+## Command line options 
+- Additional locust command line options provided ([source](locust_plugins/__init__.py), [examples](examples/cmd_line_examples.sh))
+    - Iteration limit (`-i`), stops Locust after a certain number of task iterations
+    - Checks (`--check-rps`, `--check-fail-ratio`, `--check-avg-response-time`), gives an error return code if certain conditions are not met
+
+# Further examples
 
 Have a look at the [example locustfiles](examples/) to learn how to use the plugins.
+
+# locust-swarm
 
 These plugins work well together with [locust-swarm](https://github.com/SvenskaSpel/locust-swarm)
 
